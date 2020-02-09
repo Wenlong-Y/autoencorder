@@ -318,6 +318,7 @@ anomaly <- h2o.anomaly(autoencoder, test) %>%
 
 
 #Image reconstruction using VAEs
+library(tensorflow)
 library(keras)
 # Switch to the 1-based indexing from R
 options(tensorflow.one_based_extract = FALSE)
@@ -344,8 +345,8 @@ z_mean <- layer_dense(hidden_state, latent_dim)
 z_log_sigma <- layer_dense(hidden_state, latent_dim)
 
 sample_z<- function(params){
-  z_mean <- params[,0:1]
-  z_log_sigma <- params[,2:3]
+  z_mean <- params[,1:2]
+  z_log_sigma <- params[,3:4]
   epsilon <- K$random_normal(
     shape = c(K$shape(z_mean)[[1]]), 
     mean=0.,
