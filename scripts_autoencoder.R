@@ -318,8 +318,155 @@ anomaly <- h2o.anomaly(autoencoder, test) %>%
 
 
 #Image reconstruction using VAEs
-library(tensorflow)
+
+
+#better version
+
 library(keras)
+library(tensorflow)
+K <- keras::backend()
+
+# Parameters --------------------------------------------------------------
+
+batch_size <- 100L
+original_dim <- 784L
+latent_dim <- 2L
+intermediate_dim <- 256L
+epochs <- 50L
+epsilon_std <- 1.0
+
+# Model definition --------------------------------------------------------
+
+x <- layer_input(shape = c(original_dim))
+h <- layer_dense(x, intermediate_dim, activation = "relu")
+z_mean <- layer_dense(h, latent_dim)
+z_log_var <- layer_dense(h, latent_dim)
+
+sampling <- function(arg){
+  z_mean <- arg[, 1:(latent_dim)]
+  z_log_var <- arg[, (latent_dim + 1):(2 * latent_dim)]
+  
+  epsilon <- k_random_normal(
+    shape = c(k_shape(z_mean)[[1]]), 
+    mean=0.,
+    stddev=epsilon_std
+  )
+  
+  z_mean + k_exp(z_log_var/2)*epsilon
+}
+
+# note that "output_shape" isn't necessary with the TensorFlow backend
+z <- layer_concatenate(list(z_mean, z_log_var)) %>% 
+  layer_lambda(sampling)
+
+# we instantiate these layers separately so as to reuse them later
+decoder_h <- layer_dense(units = intermediate_dim, activation = "relu")
+decoder_mean <- layer_dense(units = original_dim, activation = "sigmoid")
+h_decoded <- decoder_h(z)
+x_decoded_mean <- decoder_mean(h_decoded)
+
+# end-to-end autoencoder
+vae <- keras_model(x, x_decoded_mean)
+
+# encoder, from inputs to latent space
+encoder <- keras_model(x, z_mean)
+
+# generator, from latent space to reconstructed inputs
+decoder_input <- layer_input(shape = latent_dim)
+h_decoded_2 <- decoder_h(decoder_input)
+x_decoded_mean_2 <- decoder_mean(h_decoded_2)
+generator <- keras_model(decoder_input, x_decoded_mean_2)
+
+
+vae_loss <- function(x, x_decoded_mean){
+  xent_loss <- (original_dim/1.0)*loss_binary_crossentropy(x, x_decoded_mean)
+  kl_loss <- -0.5*k_mean(1 + z_log_var - k_square(z_mean) - k_exp(z_log_var), axis = -1L)
+  xent_loss + kl_loss
+}
+
+vae %>% compile(optimizer = "rmsprop", loss = vae_loss, experimental_run_tf_function = FALSE)
+      
+ 
+
+
+# Data preparation --------------------------------------------------------
+
+mnist <- dataset_mnist()
+x_train <- mnist$train$x/255
+x_test <- mnist$test$x/255
+x_train <- array_reshape(x_train, c(nrow(x_train), 784), order = "F")
+x_test <- array_reshape(x_test, c(nrow(x_test), 784), order = "F")
+y_train <- mnist$train$y
+y_test <- mnist$test$y
+
+# Model training ----------------------------------------------------------
+
+history <- vae %>% fit(
+  x_train, x_train, 
+  shuffle = TRUE, 
+  epochs = epochs, 
+  batch_size = batch_size, 
+  validation_data = list(x_test, x_test)
+)
+plot(history)
+
+library(tidyverse)
+
+library(ggplot2)
+preds <- vae %>% predict(x_test)
+error <- rowSums((preds-x_test)**2)
+evalerr <- data.frame(error=error, class=as.factor(y_test))
+
+# Reshape original and reconstructed
+dim(x_test) <- c(nrow(x_test),28,28)
+dim(preds) <- c(nrow(preds),28,28)
+image(255*preds[1,,], col=gray.colors(3))
+y_test[1]
+image(255*x_test[1,,], col=gray.colors(3))
+
+
+x_test_encoded <- predict(encoder, x_test, batch_size = batch_size)
+
+x_test_encoded %>%
+  as_data_frame() %>% 
+  mutate(class = as.factor(mnist$test$y)) %>%
+  ggplot(aes(x = V1, y = V2, colour = class)) + geom_point()
+
+
+# display a 2D manifold of the digits
+n <- 15  # figure with 15x15 digits
+digit_size <- 28
+
+# we will sample n points within [-4, 4] standard deviations
+grid_x <- seq(-4, 4, length.out = n)
+grid_y <- seq(-4, 4, length.out = n)
+
+rows <- NULL
+for(i in 1:length(grid_x)){
+  column <- NULL
+  for(j in 1:length(grid_y)){
+    z_sample <- matrix(c(grid_x[i], grid_y[j]), ncol = 2)
+    column <- rbind(column, predict(generator, z_sample) %>% matrix(ncol = 28) )
+  }
+  rows <- cbind(rows, column)
+}
+rows %>% as.raster() %>% plot()
+
+
+x_test <- array_reshape(x_test, c(nrow(x_test), 784), order = "F")
+y_train <- mnist$train$y
+y_test <- mnist$test$y
+evalerr <- data.frame(error=error, class=as.factor(y_test))
+evalerr %>% 
+  group_by(class) %>% 
+  summarise(avg_error=mean(error)) %>% 
+  ggplot(aes(x=class,fill=class,y=avg_error))+geom_col()
+
+
+#Outlier Detection in MINST
+
+library(keras)
+library(tensorflow)
 # Switch to the 1-based indexing from R
 options(tensorflow.one_based_extract = FALSE)
 K <- keras::backend()
@@ -328,6 +475,10 @@ X_train <- mnist$train$x
 y_train <- mnist$train$y
 X_test <- mnist$test$x
 y_test <- mnist$test$y
+## Exclude "0" from the training set. "0" will be the outlier
+outlier_idxs <- which(y_train!=0, arr.ind = T)
+X_train <- X_train[outlier_idxs,,]
+y_test <- sapply(y_test, function(x){ ifelse(x==0,"outlier","normal")})
 # reshape
 dim(X_train) <- c(nrow(X_train), 784)
 dim(X_test) <- c(nrow(X_test), 784)
@@ -336,85 +487,142 @@ X_train <- X_train / 255
 X_test <- X_test / 255
 
 
-orig_dim <- 784
-latent_dim <- 2
-inner_dim <- 256
-X <- layer_input(shape = c(orig_dim))
-hidden_state <- layer_dense(X, inner_dim, activation = "relu")
+original_dim <- 784L
+latent_dim <- 2L
+intermediate_dim <- 256L
+X <- layer_input(shape = c(original_dim))
+hidden_state <- layer_dense(X, intermediate_dim, activation = "relu")
 z_mean <- layer_dense(hidden_state, latent_dim)
 z_log_sigma <- layer_dense(hidden_state, latent_dim)
 
 sample_z<- function(params){
-  z_mean <- params[,1:2]
-  z_log_sigma <- params[,3:4]
-  epsilon <- K$random_normal(
-    shape = c(K$shape(z_mean)[[1]]), 
+  z_mean <- params[,0:1]
+  z_log_sigma <- params[,2:3]
+  epsilon <- k_random_normal(
+    shape = c(k_shape(z_mean)[[1]]), 
     mean=0.,
-    stddev=1
+    stddev=1.0
   )
-  z_mean + K$exp(z_log_sigma/2)*epsilon
+  z_mean + k_exp(z_log_sigma/2)*epsilon
 }
 
-z <- layer_concatenate(list(z_mean, z_log_sigma)) %>%
+
+
+z <- layer_concatenate(list(z_mean, z_log_sigma)) %>% 
   layer_lambda(sample_z)
-
-decoder_hidden_state <- layer_dense(units = inner_dim, activation = "relu")
-decoder_mean <- layer_dense(units = orig_dim, activation = "sigmoid")
+decoder_hidden_state <- layer_dense(units = intermediate_dim, activation = "relu")
+decoder_mean <- layer_dense(units = original_dim, activation = "sigmoid")
 hidden_state_decoded <- decoder_hidden_state(z)
-X_decoded_mean <- decoder_mean(hidden_state_decoded)
+decoded_X_mean <- decoder_mean(hidden_state_decoded)
 
-# end-to-end autoencoder
-variational_autoencoder <- keras_model(X, X_decoded_mean)
 
+variational_autoencoder <- keras_model(X, decoded_X_mean)
 encoder <- keras_model(X, z_mean)
 decoder_input <- layer_input(shape = latent_dim)
+decoded_hidden_state_2 <- decoder_hidden_state(decoder_input)
+decoded_X_mean_2 <- decoder_mean(decoded_hidden_state_2)
+generator <- keras_model(decoder_input, decoded_X_mean_2)
 
 loss_function <- function(X, decoded_X_mean){
-  cross_entropy_loss <- loss_binary_crossentropy(X, decoded_X_mean)
-  kl_loss <- -0.5*K$mean(1 + z_log_sigma - K$square(z_mean) - K$exp(z_log_sigma), axis = -1L)
+  cross_entropy_loss <- (original_dim/1.0)*loss_binary_crossentropy(X, decoded_X_mean)
+  kl_loss <- -0.5*k_mean(1 + z_log_sigma - k_square(z_mean) - k_exp(z_log_sigma), axis = -1L)
   cross_entropy_loss + kl_loss
 }
 
 
-variational_autoencoder %>% compile(optimizer = "rmsprop", loss = loss_function, experimental_run_tf_function=FALSE)
+variational_autoencoder %>% compile(optimizer = "rmsprop", loss = loss_function, experimental_run_tf_function = FALSE)
 history <- variational_autoencoder %>% fit(
   X_train, X_train, 
   shuffle = TRUE, 
-  epochs = 10, 
+  epochs = 50, 
   batch_size = 256, 
   validation_data = list(X_test, X_test)
 )
 plot(history)
 
-library(tidyverse)
-library(ggplot2)
+
 preds <- variational_autoencoder %>% predict(X_test)
 error <- rowSums((preds-X_test)**2)
 eval <- data.frame(error=error, class=as.factor(y_test))
+library(dplyr)
+library(ggplot2)
 eval %>% 
-  group_by(class) %>% 
-  summarise(avg_error=mean(error)) %>% 
-  ggplot(aes(x=class,fill=class,y=avg_error))+geom_col()
+  ggplot(aes(x=class,fill=class,y=error))+geom_boxplot()
 
 
-# Reshape original and reconstructed
-dim(X_test) <- c(nrow(X_test),28,28)
-dim(preds) <- c(nrow(preds),28,28)
-image(255*preds[1,,], col=gray.colors(3))
-y_test[1]
-image(255*X_test[1,,], col=gray.colors(3))
+threshold <- 5
+y_preds <- sapply(error, function(x){ifelse(x>threshold,"outlier","normal")})
 
-grid_x <- seq(-4, 4, length.out = 3)
-grid_y <- seq(-4, 4, length.out = 3)
 
-rows <- NULL
-for(i in 1:length(grid_x)){
-  column <- NULL
-  for(j in 1:length(grid_y)){
-    z_sample <- matrix(c(grid_x[i], grid_y[j]), ncol = 2)
-    column <- rbind(column, preds[sample(dim(X_test)[1],1),,] %>% matrix(ncol = 28) ) 
-  }
-  rows <- cbind(rows,column) #this part is omitted in the book
-}
-rows %>% as.raster() %>% plot()
+table(y_preds,y_test)
 
+
+library(ROCR)
+pred <- prediction(error, y_test)
+perf <- performance(pred, measure = "tpr", x.measure = "fpr")
+auc <- unlist(performance(pred, measure = "auc")@y.values)
+auc
+plot(perf, col=rainbow(10))
+
+
+
+
+#Text fraud detection
+
+# Enron email fraud
+
+#install.packages("tm")
+#install.packages("SnowballC")
+
+df <- read.csv("./data/enron.csv")
+names(df)
+
+names(df) <-c("emails","responsive")
+
+library(tm)
+corpus <- Corpus(VectorSource(df$email))
+
+corpus <- tm_map(corpus,tolower)
+corpus <- tm_map(corpus, removePunctuation)
+corpus <- tm_map(corpus, removeWords, stopwords("english"))
+corpus <- tm_map(corpus, stemDocument)
+
+dtm <- DocumentTermMatrix(corpus)
+dtm <-  removeSparseTerms(dtm, 0.97)
+X <- as.data.frame(as.matrix(dtm))
+X$responsive <- df$responsive
+
+# Train, test, split
+library(caTools)
+set.seed(42)
+spl <- sample.split(X$responsive, 0.7)
+train <- subset(X, spl == TRUE)
+test <- subset(X, spl == FALSE)
+train <- subset(train, responsive==0)
+
+X_train <- subset(train,select=-responsive)
+y_train <- train$responsive
+X_test <- subset(test,select=-responsive)
+y_test <- test$responsive
+
+
+library(keras)
+input_dim <- ncol(X_train)
+inner_layer_dim <- 32
+input_layer <- layer_input(shape=c(input_dim))
+encoder <- layer_dense(units=inner_layer_dim, activation='relu')(input_layer)
+decoder <- layer_dense(units=input_dim)(encoder)
+autoencoder <- keras_model(inputs=input_layer, outputs = decoder)
+autoencoder %>% compile(optimizer='adam', 
+                        loss='mean_squared_error', 
+                        metrics=c('accuracy'))
+
+
+X_train <- as.matrix(X_train)
+X_test <- as.matrix(X_test)
+history <- autoencoder %>% fit(
+  X_train,X_train, 
+  epochs = 100, batch_size = 32, 
+  validation_data = list(X_test, X_test)
+)
+plot(history)
